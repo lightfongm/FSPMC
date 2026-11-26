@@ -1,0 +1,832 @@
+# 孔雀排程系统 V3.0 — 完整重建方案
+
+> **用途**：供其他 AI/开发者准确重建本系统全部功能。
+> **日期**：2026-07-08
+
+---
+
+## 一、系统架构总览
+
+```
+┌─────────────────────────────────────────────────┐
+│                  前端 (单页HTML)                   │
+│   enhanced.html (~1.1MB, 18775行)                │
+│   内嵌 CSS + JS，9个主标签页                       │
+├─────────────────────────────────────────────────┤
+│                  后端 (Flask)                     │
+│   api.py (~435KB, 10126行)                       │
+│   110个API路由 + 所有业务逻辑                      │
+├────────────┬──────────────┬─────────────────────┤
+│ SAP SOAP   │ Python 模块  │   SQL Server 数据库   │
+│ 7个接口    │ 排程引擎     │   25张业务表          │
+│ PP019/077B │ 就绪度计算   │   schedule_system     │
+│ SD059/MM066│ 优先级排序   │                      │
+│ PP062/087  │              │                      │
+└────────────┴──────────────┴─────────────────────┘
+```
+
+- **运行环境**：Python 3.13 + Flask + pymssql (优先) / pyodbc (备用)
+- **端口**：5000
+- **启动方式**：`scripts/打开系统.bat` → 启动后端 + 打开浏览器
+- **数据库**：SQL Server (schedule_system)
+
+---
+
+## 二、SAP 接口配置
+
+### 2.1 SAP 服务器环境
+
+| 环境 | 主机地址 | 接口 | 状态 |
+|------|----------|------|------|
+| **PRD生产** | `sappo.hbglobal.com:8011` | PP077B, PP019, MM066, PP087 | 运行中 |
+| **PRD4生产** | `sappoprd4.hbglobal.com:50100` | SD059 | 运行中 |
+| **QAS测试** | `sappoqas.hbglobal.com:50000` | PP062(BOM), 客户主数据 | 运行中 |
+
+- **统一认证**：用户 `bc_con`，密码通过系统配置界面设置（不在源码中明文存储）
+- **协议**：SOAP over HTTP
+- **SOAP路径格式**：`/XISOAPAdapter/MessageServlet?channel=...&version=3.0&Sender.Service=...&Interface=...`
+
+### 2.2 7个SAP接口明细
+
+#### ① PP077B — 计划工单读取
+| 项目 | 内容 |
+|------|------|
+| 用途 | 排程计算的数据源，读取SAP计划订单及其子件 |
+| 输入 | 工厂(WERKS), 日期范围(BEGDA/ENDDA), 最大条数(MAX_RECORDS) |
+| 响应结构 | `ns:mt_pp077b_res` → `DATA`(主表28字段) → `ITEM`(子件9字段) |
+| 主表字段 | PLNUM(计划订单号), MATNR(物料), MAKTX(描述), GSMNG(数量), PSTTR(开始), PEDTR(结束), ARBPL(工作中心), PAART(订单类型), DISPO(MRP), ZCATEG(分类), ZCATEXT(分类描述), PLWRK/PWWRK(工厂), PERTR(计划开工日), AVMNG(可用量), LGORT(库存地点), VERID(生产版本), RSNUM(预留号)... |
+| 子件字段 | RSNUM, RSPOS, POSNR, MATNR, MAKTX, BDMNG(需求数量), MEINS(单位), ENMNG(已发), VMENG(可发) |
+| 保存目标表 | `sap_planned_orders`(父项) + `sap_planned_order_items`(子项) |
+| 同步模式 | 全量+增量(UPSERT by plnum) |
+
+#### ② PP019 — 生产工单读取
+| 项目 | 内容 |
+|------|------|
+| 用途 | 工单管理页签，读取SAP已有生产工单 |
+| 输入 | 工厂(WERKS), 工单号(AUFNR), 日期范围(AEDAT1/AEDAT2), 时间(AEZEIT1/AEZEIT2), 最大条数 |
+| 响应结构 | `ns:mt_pp019_res` → `HEAD`(表头) → `ITEM`(产出物料) → `RESB`(组件物料) |
+| 表头字段 | AUFNR(工单号), KTEXT(短文本), WERKS(工厂), ARBPL(工作中心), GAMNG(目标数量), GSTRP/GLTRP(排程日期), GSTRP/GLTRS(实际日期), STAT(状态), DISPO(MRP), FEVOR, PSPSP(项目)... |
+| 组件字段 | RSNUM, RSPOS, MATNR, BDMNG, MEINS, POSTP(项目类别), WERKS, LGORT |
+| 保存目标表 | `work_orders` + `work_orders_items` |
+| 同步模式 | 增量为主 (自动从MAX(updated_at)计算AEDAT1) |
+| 客供料判断 | POSTP类别=L/N/K → 客供; 或 products表beskz/物料组含客供标识 |
+
+#### ③ MM066 — 库存读取
+| 项目 | 内容 |
+|------|------|
+| 用途 | 读取SAP物料库存 |
+| 输入 | 工厂(WERKS), 物料(MATNR), 库存地点(LGORT,可多仓库), 批次(CHARG) |
+| 响应结构 | 扁平SOAP格式, `ns:mt_mm066_res` |
+| 存储字段 | material_code, sap_lgort(仓库), sap_labst(非限制), sap_insme(质检), sap_speme(冻结), sap_umlme(在途), sap_meins(单位), sap_charg(批次) |
+| 保存表 | `inventory` (先删后插全量) |
+| 降级机制 | PRD 500 → 自动降级 QAS(sappoqas:50000) → 本地缓存 |
+
+#### ④ SD059 — 销售订单读取
+| 项目 | 内容 |
+|------|------|
+| 用途 | 销售订单和发货计划的数据源 |
+| 输入 | VKORG(销售组织), AUDAT范围, 订单类型, VBELN |
+| 响应结构 | `mt_sd059_res` → `DATA`(表头) → `ITEM`(表体) |
+| 表头字段 | VBELN(订单号), ERDAT(创建日期), VDATU(交货日期), KUNNR(客户), NAME1(客户名), AUART(订单类型), WAERK(币种), BSTNK(客户PO号)... |
+| 表体字段 | POSNR(行项目), MATNR(物料), ARKTX(描述), KWMENG(数量), KWMENG, VRKME(单位), NETPR(净价), ABGRU(拒绝原因)... |
+| 保存表 | `sap_sales_orders` + `sap_sales_order_items` |
+| 注意 | PSTYV字段SAP不返回，需从响应中自行提取或留空 |
+| nokwmeng处理 | 若为0且kwmeng>0，自动计算 = max(0, kwmeng - lfimg) |
+
+#### ⑤ PP087 — 物料主数据
+| 项目 | 内容 |
+|------|------|
+| 用途 | 基础参数-物料管理，读取物料主数据 |
+| 输入 | WERKS, MATNR, BEGDA/ENDDA |
+| 字段 | 含50+列SAP扩展字段：冻结标志(MSTAE), 保质期(MHDRZ/MHDHB), 物料形态(ZFLGMT), 单位成本(STPRS), 安全库存(ZSTOCK/ZSMSTD), 工厂状态(MMSTA), 删除标志(LVORM)... |
+| 保存表 | `products` (UPSERT by material_code/sap_matnr) |
+| 同步模式 | 增量智能判断(空表→全量, 有数据→增量) |
+
+#### ⑥ PP062 — BOM读取
+| 项目 | 内容 |
+|------|------|
+| 用途 | BOM管理子标签，读取物料清单 |
+| 输入 | WERKS, MATNR, STLAN(BOM用途), 日期范围 |
+| 保存表 | `bom` (bom_key = 父物料+子物料+工厂+用途+替代组合) |
+| 字段 | parent_matnr, comp_matnr(子件), comp_menge(用量), comp_meins, POSTP(项目类别), LGORT, AUCH(工序报废) |
+
+#### ⑦ 客户主数据
+| 项目 | 内容 |
+|------|------|
+| 用途 | 基础参数-SAP客户管理 |
+| 输入 | 组织单位, KUNNR, BUKRS, 日期范围 |
+| 保存表 | `customers` |
+
+### 2.3 SAP XML 解析规则 (重要)
+```python
+# 正确方式: 直接用ElementTree + 去除命名空间前缀的tag
+import xml.etree.ElementTree as ET
+root = ET.fromstring(response_text)
+def _local_tag(elem):
+    return elem.tag.split('}')[-1] if '}' in elem.tag else elem.tag
+
+# 遍历方式
+for node in root.iter():
+    if _local_tag(node) == 'DATA':
+        ...
+```
+**禁止**：用正则 `re.sub(r'<(/%s)[\w]+:([\w]+)', ...)` 清理命名空间 — `%s` 在raw string下为字面量字符无法匹配。
+
+---
+
+## 三、数据库表结构
+
+### 3.1 核心业务表 (25张)
+
+#### ① products — 产品/物料主数据 (50列)
+```sql
+id NVARCHAR(50) PRIMARY KEY
+material_code NVARCHAR(50)        -- 物料编码
+name NVARCHAR(200)                -- 物料名称
+type NVARCHAR(50)                 -- 类型(基料/中间品/半成品/产成品)
+category NVARCHAR(100)            -- 分类
+workshop NVARCHAR(100)            -- 作业中心
+secret NVARCHAR(10)               -- 保密标识
+production_time DECIMAL(10,2)     -- 标准工时
+production_cycle DECIMAL(10,2)    -- 生产周期
+batch_size INT                    -- 固定批量
+energy_coeff DECIMAL(10,2)        -- 能耗系数
+priority NVARCHAR(20)             -- MRP优先级
+unit_price DECIMAL(18,6)          -- 单价
+safe_stock DECIMAL(18,3)          -- 安全库存
+unit NVARCHAR(20)                 -- 单位
+old_material_code NVARCHAR(50)    -- 旧物料号
+material_group NVARCHAR(50)       -- 物料组
+material_trial_no NVARCHAR(100)   -- 物料试制号
+storage_condition NVARCHAR(200)   -- 存储条件
+size_dimension NVARCHAR(100)      -- 规格尺寸
+created_date NVARCHAR(20)         -- 创建日期
+updated_at DATETIME DEFAULT GETDATE()
+data_source NVARCHAR(50)
+-- SAP PP087 扩展字段 (30+列):
+sap_matnr, sap_maktx, sap_meins, sap_bstme, sap_ersda, sap_bismt,
+sap_matkl, sap_mstae, sap_mhdrz, sap_mhdhb, sap_iprkz, sap_lbtxt,
+sap_rbtxt, sap_groes, sap_xchpf, sap_zscfg, sap_zdjfg, sap_werks,
+sap_zcateg, sap_zjwlh, sap_stprs DECIMAL(18,6), sap_peinh DECIMAL(18,3),
+sap_zflgmt, sap_zstock DECIMAL(18,3), sap_zsmstd DECIMAL(18,3),
+sap_mmsta, sap_lvorm
+```
+
+#### ② sap_planned_orders — SAP计划订单主表 (34列)
+```sql
+id NVARCHAR(50) PK, plnum NVARCHAR(20) NOT NULL, matnr NVARCHAR(50),
+maktx NVARCHAR(200), zcateg NVARCHAR(20), zcatext NVARCHAR(50),
+plwrk NVARCHAR(10), pwwrk NVARCHAR(10), psttr NVARCHAR(8), pedtr NVARCHAR(8),
+pertr NVARCHAR(8), dispo NVARCHAR(20), paart NVARCHAR(10),
+gsmng DECIMAL(18,3), meins NVARCHAR(10), avmng DECIMAL(18,3),
+umskz NVARCHAR(10), kdauf NVARCHAR(20), kdpos NVARCHAR(10),
+lgort NVARCHAR(10), paltr NVARCHAR(8), stlan NVARCHAR(10),
+stalt NVARCHAR(10), ststa NVARCHAR(10), verid NVARCHAR(10),
+arbpl NVARCHAR(20), rsnum NVARCHAR(20), auffx NVARCHAR(10),
+sobkz NVARCHAR(10), knttp NVARCHAR(10), item_count INT DEFAULT 0,
+is_scheduled BIT DEFAULT 0, scheduled_at DATETIME,
+schedule_order NVARCHAR(4) DEFAULT NULL,
+updated_at DATETIME DEFAULT GETDATE(), data_source NVARCHAR(50) DEFAULT 'sap_pp077b'
+索引: idx_sap_planned_orders_plnum, idx_sap_planned_orders_matnr
+```
+
+#### ③ sap_planned_order_items — SAP计划订单子件表 (15列)
+```sql
+id NVARCHAR(50) PK, plnum NVARCHAR(20) NOT NULL, rsnum NVARCHAR(20) NOT NULL,
+rspos NVARCHAR(10) NOT NULL, posnr NVARCHAR(10), matnr NVARCHAR(50),
+maktx NVARCHAR(200), werks NVARCHAR(10), lgort NVARCHAR(10),
+bdter NVARCHAR(8), bdmng DECIMAL(18,3), meins NVARCHAR(10),
+enmng DECIMAL(18,3), vmeng DECIMAL(18,3),
+updated_at DATETIME DEFAULT GETDATE(), data_source NVARCHAR(50)
+索引: idx_sap_planned_order_items_plnum, idx_sap_planned_order_items_rsnum
+```
+
+#### ④ work_orders — 生产工单表 (41列为主+~20列SAP扩展)
+```sql
+id NVARCHAR(50) PK, order_no NVARCHAR(100), product_id NVARCHAR(50),
+quantity DECIMAL(10,2), start_date DATE, end_date DATE, status NVARCHAR(20),
+priority NVARCHAR(20), note NVARCHAR(MAX), updated_at DATETIME DEFAULT GETDATE(),
+-- 前端显示字段:
+material_code NVARCHAR(50), material_desc NVARCHAR(200), plant NVARCHAR(10),
+workcenter_name NVARCHAR(200), plan_qty DECIMAL(10,2), confirm_qty DECIMAL(10,2),
+unit NVARCHAR(10), batch NVARCHAR(20), client_name NVARCHAR(200),
+client_code NVARCHAR(50), sap_status_text NVARCHAR(100), order_type NVARCHAR(20),
+sales_order_id NVARCHAR(50), responsible_name NVARCHAR(100),
+-- SAP PP019字段:
+sap_aufnr NVARCHAR(100), sap_matnr NVARCHAR(50), sap_maktx NVARCHAR(200),
+sap_werks NVARCHAR(10), sap_gamng DECIMAL(10,2), sap_gstrs DATE,
+sap_gltrs DATE, sap_gstrp DATE, sap_gltrp DATE, sap_stat NVARCHAR(10),
+sap_ktxt VARCHAR(100), sap_ktext NVARCHAR(200), sap_arbpl NVARCHAR(20),
+sap_charg NVARCHAR(20), sap_plbez NVARCHAR(40), sap_dispo NVARCHAR(20),
+sap_fevor NVARCHAR(20), sap_iwerk NVARCHAR(10), sap_ilgst NVARCHAR(4),
+sap_audat DATE, sap_bstdk DATE, sap_stufe NVARCHAR(2), sap_pspid NVARCHAR(20),
+sap_psp_text NVARCHAR(200), sap_prctr NVARCHAR(10), sap_gewrk NVARCHAR(20),
+sap_funk1 NVARCHAR(20), sap_stort NVARCHAR(20), sap_meins NVARCHAR(10),
+sap_bmeng DECIMAL(14,4), sap_meinh NVARCHAR(10),
+sap_kunnr NVARCHAR(50), sap_name1 NVARCHAR(200)
+```
+
+#### ⑤ work_orders_items — 工单组件明细 (26列)
+```sql
+id NVARCHAR(100) PK, aufnr NVARCHAR(100) NOT NULL,
+rsnum NVARCHAR(50), rspos NVARCHAR(50), posnr NVARCHAR(50),
+rsmatnr NVARCHAR(50), matnr NVARCHAR(50), comp_matnr NVARCHAR(50),
+comp_desc NVARCHAR(200), plan_qty DECIMAL(18,3), unit NVARCHAR(20),
+issued_qty DECIMAL(18,3), available_qty DECIMAL(18,3),
+requirement_date DATE, plant NVARCHAR(20), storage_loc NVARCHAR(20),
+item_category NVARCHAR(20), postp NVARCHAR(20),
+is_customer_supplied NVARCHAR(10) DEFAULT 'N',
+comp_menge DECIMAL(18,3), comp_meins NVARCHAR(20),
+comp_maktx NVARCHAR(200),
+updated_at DATETIME DEFAULT GETDATE(), data_source NVARCHAR(50)
+索引: idx_work_orders_items_aufnr
+```
+
+#### ⑥ inventory — 库存表 (22列)
+```sql
+id NVARCHAR(100) PK, material_code NVARCHAR(50), name NVARCHAR(200),
+quantity DECIMAL(18,3), unit NVARCHAR(20), location NVARCHAR(100),
+min_stock DECIMAL(18,3), updated_at DATETIME DEFAULT GETDATE(),
+-- SAP MM066字段:
+sap_matnr NVARCHAR(50), sap_maktx NVARCHAR(200), sap_werks NVARCHAR(20),
+sap_lgort NVARCHAR(20), sap_charg NVARCHAR(50), sap_labst DECIMAL(18,3),
+sap_insme DECIMAL(18,3), sap_speme DECIMAL(18,3), sap_umlme DECIMAL(18,3),
+sap_meins NVARCHAR(20), sap_raw_json NVARCHAR(MAX),
+-- 升级字段:
+lgort_name NVARCHAR(100), sap_sobkz NVARCHAR(20), stock_type NVARCHAR(10)
+```
+
+#### ⑦ sap_sales_orders — SAP销售订单表头 (22列)
+```sql
+id NVARCHAR(50) PK, vbeln NVARCHAR(20) NOT NULL, erdat NVARCHAR(8),
+audat NVARCHAR(8), vdatu NVARCHAR(8), kunnr NVARCHAR(20),
+name1 NVARCHAR(200), auart NVARCHAR(10), augru NVARCHAR(10),
+waerk NVARCHAR(10), vkorg NVARCHAR(10), vtweg NVARCHAR(10),
+spart NVARCHAR(10), vkbur NVARCHAR(10), vkgrp NVARCHAR(10),
+bstnk NVARCHAR(500), bstdk NVARCHAR(8), status NVARCHAR(20) DEFAULT 'open',
+item_count INT DEFAULT 0, note NVARCHAR(MAX),
+updated_at DATETIME DEFAULT GETDATE(), data_source NVARCHAR(50),
+-- 升级字段: gbstk NVARCHAR(10), lfstk NVARCHAR(10)
+```
+
+#### ⑧ sap_sales_order_items — SAP销售订单行项目 (23列)
+```sql
+id NVARCHAR(50) PK, vbeln NVARCHAR(20) NOT NULL, posnr NVARCHAR(10) NOT NULL,
+matnr NVARCHAR(50), arktx NVARCHAR(200), kwmeng DECIMAL(18,3),
+vrkme NVARCHAR(10), netpr DECIMAL(18,6), kpein INT, kmein NVARCHAR(10),
+werks NVARCHAR(10), lgort NVARCHAR(10), vdatu NVARCHAR(8),
+abgru NVARCHAR(10), note NVARCHAR(MAX),
+updated_at DATETIME DEFAULT GETDATE(),
+-- 升级字段:
+nokwmeng DECIMAL(18,3), lfimg DECIMAL(18,3),
+gbsta NVARCHAR(50), lfsta NVARCHAR(50),
+kzwi1 DECIMAL(18,6), mwsbp DECIMAL(18,6), pstyv NVARCHAR(50)
+```
+
+#### ⑨ bom — BOM表 (19列)
+```sql
+bom_key NVARCHAR(200) PK
+parent_matnr NVARCHAR(50), parent_maktx NVARCHAR(200), werks NVARCHAR(10),
+stlan NVARCHAR(10), stlal NVARCHAR(10), posnr NVARCHAR(20),
+comp_matnr NVARCHAR(50), comp_maktx NVARCHAR(200),
+comp_menge DECIMAL(18,4), comp_meins NVARCHAR(10), postp NVARCHAR(10),
+comp_datuv NVARCHAR(20), comp_datub NVARCHAR(20), lgort NVARCHAR(10),
+ausch DECIMAL(10,4), sortf NVARCHAR(20),
+data_source NVARCHAR(50), updated_at DATETIME DEFAULT GETDATE()
+```
+
+#### ⑩ peacock_schedule — 排程结果表 (42列)
+```sql
+id NVARCHAR(100) PK, aufnr NVARCHAR(100) NOT NULL, order_no NVARCHAR(50),
+material_code NVARCHAR(50) NOT NULL, old_material_code NVARCHAR(50),
+material_name NVARCHAR(200), material_type NVARCHAR(50),
+plant NVARCHAR(20), work_center NVARCHAR(50), order_status NVARCHAR(20),
+plan_qty DECIMAL(18,3), issued_qty DECIMAL(18,3), required_qty DECIMAL(18,3),
+start_date DATE, finish_date DATE, customer_code NVARCHAR(50),
+customer_name NVARCHAR(200), customer_priority INT,
+ready_status NVARCHAR(20), status_description NVARCHAR(500),
+ready_components INT, partial_components INT, missing_components INT,
+total_components INT,
+peacock_status NVARCHAR(20), peacock_description NVARCHAR(500),
+suggest_order NVARCHAR(10), suggest_reason NVARCHAR(500),
+due_date_priority INT, customer_priority_score INT, overall_priority INT,
+schedule_sequence INT, has_parent_bom BIT DEFAULT 0, has_child_bom BIT DEFAULT 0,
+cost_center_type NVARCHAR(50), special_condition NVARCHAR(20),
+calculated_at DATETIME DEFAULT GETDATE(), calculated_by NVARCHAR(50),
+is_deleted BIT DEFAULT 0, updated_at DATETIME DEFAULT GETDATE()
+索引: idx_peacock_schedule_aufnr, _status, _priority, _material
+```
+
+#### ⑪ peacock_material_shortage — 缺料明细表 (25列)
+```sql
+id NVARCHAR(100) PK, schedule_id NVARCHAR(100) NOT NULL,
+aufnr NVARCHAR(100) NOT NULL, material_code NVARCHAR(50) NOT NULL,
+component_code NVARCHAR(50) NOT NULL, component_name NVARCHAR(200),
+component_type NVARCHAR(50), required_qty DECIMAL(18,3),
+available_qty DECIMAL(18,3), current_stock DECIMAL(18,3),
+quality_stock DECIMAL(18,3), frozen_stock DECIMAL(18,3),
+storage_loc NVARCHAR(500), shortage_type NVARCHAR(20),
+stock_status NVARCHAR(20), need_qty DECIMAL(18,3),
+is_parent_material BIT DEFAULT 0, parent_code NVARCHAR(50),
+bom_level INT, use_quality_stock BIT DEFAULT 0,
+use_frozen_stock BIT DEFAULT 0, inventory_detail NVARCHAR(MAX),
+created_at DATETIME DEFAULT GETDATE(), updated_at DATETIME DEFAULT GETDATE()
+```
+
+#### ⑫ peacock_calculation_logs — 计算日志
+```sql
+id INT IDENTITY(1,1) PK, calculation_id NVARCHAR(50) NOT NULL,
+log_type NVARCHAR(50) NOT NULL, timestamp NVARCHAR(20),
+description NVARCHAR(MAX), order_no NVARCHAR(50), details NVARCHAR(MAX),
+created_at DATETIME DEFAULT GETDATE()
+索引: idx_calculation_id, idx_order_no
+```
+
+#### ⑬ delivery_plan_results — 发货计划结果 (22列)
+```sql
+id INT IDENTITY(1,1) PK, line_no INT NOT NULL,
+created_date NVARCHAR(20), delivery_date NVARCHAR(20),
+material_code NVARCHAR(50), material_desc NVARCHAR(200),
+quantity DECIMAL(18,3), unit NVARCHAR(20),
+fulfillment_type NVARCHAR(50),   -- 发货满足类型(6种)
+can_deliver NVARCHAR(20),        -- 可发货状态(3种)
+sales_order_no NVARCHAR(20), customer_name NVARCHAR(200),
+stock_qty DECIMAL(18,3), production_qty DECIMAL(18,3),
+remaining_available DECIMAL(18,3), plan_finish_date NVARCHAR(20),
+due_date NVARCHAR(20), lead_days INT, priority_option NVARCHAR(50),
+calculation_batch NVARCHAR(50), plant NVARCHAR(10),
+note NVARCHAR(500), created_at DATETIME DEFAULT GETDATE(),
+updated_at DATETIME DEFAULT GETDATE()
+```
+
+#### ⑭-⑳ 其他表 (简化)
+| 表名 | 用途 | 关键字段 |
+|------|------|----------|
+| `customers` | 客户主数据 | id PK, name, sap_kunnr, sap_name1... (37列) |
+| `equipment` | 设备表 | id PK, name, type, workshop, capacity... |
+| `staff` | 人员表 | id PK, name, role, team, shift... |
+| `sales_orders` | 销售订单(旧) | id PK, order_no, customer_id, material_code... |
+| `schedules` | 排程表(旧) | id PK, work_order_id, equipment_id, start_time... |
+| `warehouse_locations` | 仓库仓位 | id PK, 仓库编码, 仓库名称, 仓库类型, 是否启用... |
+| `barcode_inventory` | 条码库存 | id PK, 物料编码, 数量, 供应商批号, SAP批号... |
+| `unlimited_materials` | 无限量物料 | material_code, material_desc |
+| `system_config` | 系统配置 | key NVARCHAR(100) PK, value NVARCHAR(MAX) |
+| `machine_configs` | 机器配置 | id PK, mac_address UNIQUE, db_host, db_password... |
+| `data_log` | 操作日志 | id IDENTITY PK, operation, table_name, record_count... |
+| `data_snapshots` | 快照 | id IDENTITY PK, snapshot_name, snapshot_data |
+| `energy_config` | 能耗配置 | id PK, equipment_id, energy_factor, preferred_hour |
+
+---
+
+## 四、核心计算逻辑
+
+### 4.1 总体数据流
+```
+数据库 (sap_planned_orders + inventory + BOM + unlimited_materials)
+         │
+         ▼
+ReadinessCalculator.calculate_readiness()
+    → 逐工单判断子件齐备状态
+    → 输出: results[] (含 A/B/C 状态)
+         │
+         ▼
+PriorityCalculator.calculate_priority()
+    → 计算优先级分数+排序
+    → 输出: sorted_results[] (含 priority_score, rank)
+         │
+         ▼
+保存到 peacock_schedule + peacock_material_shortage
+```
+
+### 4.2 齐备套计算算法 (ReadinessCalculator)
+
+**输入参数**：
+```json
+{
+  "plan_order_nums": ["5292"],   // 可选，指定订单号列表
+  "limit": 100,                   // 计算数量上限
+  "enabled_warehouses": [],       // 启用的仓库列表
+  "calc_actual_required": false,  // 是否计算实际需求
+  "enabled_stock_types": ["unrestricted"]  // 库存类型: unrestricted/quality/blocked/transit
+}
+```
+
+**库存累加公式**（按 enabled_stock_types 累加）：
+```
+总库存 = 
+  IF 'unrestricted' THEN quantity END +
+  IF 'quality' THEN sap_insme END +
+  IF 'blocked' THEN sap_speme END +
+  IF 'transit' THEN sap_umlme END
+```
+
+**子件状态判定规则**：
+```
+IF 物料在unlimited_codes中:
+    status = 'READY' (无限量物料始终齐备)
+    current_stock = max(current_stock, comp_qty)
+
+ELIF current_stock >= comp_qty:
+    status = 'READY' (库存充足)
+
+ELIF current_stock > 0:
+    status = 'PARTIAL' (有库存但不够)
+
+ELSE:
+    status = 'MISSING' (完全缺料)
+```
+
+**订单整体状态判定**：
+```
+IF missing_count == 0 AND partial_count == 0 → 'A' (齐备)
+ELIF missing_count == 0                     → 'B' (部分齐备)
+ELSE                                         → 'C' (欠齐备/缺料)
+```
+
+**子件字段计算**：
+```
+available_qty       = current_stock            (初值=库存)
+remaining_available = current_stock - required_qty
+actual_required_qty = max(0, required_qty - current_stock)  (if calc_actual_required)
+                      else required_qty
+```
+
+### 4.3 优先级计算算法 (PriorityCalculator)
+
+**优先级分数公式**：
+```
+priority_score = base_score + urgency_score + qty_score
+范围: 7 ~ 140
+```
+
+**基础分 (base_score)**：
+
+| 状态 | 分数 |
+|------|------|
+| A (齐备) | **100** |
+| B (部分) | **50** |
+| C (缺料) | **0** |
+
+**交期紧迫度 (urgency_score)**：
+
+| 距离交货天数 | 分数 |
+|-------------|------|
+| < 0 (已过期) | 30 |
+| ≤ 3 | 25 |
+| ≤ 7 | 20 |
+| ≤ 14 | 15 |
+| ≤ 30 | 10 |
+| > 30 | 5 |
+| 无交期 | 0 |
+
+**数量加分 (qty_score)**：
+
+| 数量 | 分数 |
+|------|------|
+| ≥ 1000 | 10 |
+| ≥ 500 | 8 |
+| ≥ 100 | 5 |
+| < 100 | 2 |
+
+**排序规则**：
+```
+1. priority_score DESC (分数高优先)
+2. plan_end ASC (交期早优先)
+```
+
+**父项物料贪心分配**：
+```
+按排序后的顺序，对每个物料编码:
+  parent_ready_qty = MIN(demand_qty, remaining_stock)
+  remaining_stock -= parent_ready_qty
+```
+
+**子项实际需求量（短差比率法）**：
+```
+shortfall = parent_demand - parent_ready_qty
+ratio = shortfall / parent_demand  (仅当 > 0)
+actual_required_qty(子件) = bdmng × ratio
+```
+
+**建议工单生成**：
+```
+suggest_create = True IF status in ['A', 'B']
+suggest_create = False IF status == 'C'
+```
+
+### 4.4 发货计划计算逻辑
+
+**数据源过滤规则**：
+```
+1. auart = 'ZOR' (订单类型)
+2. lfstk NOT IN ('C', '已完成') (抬头交货状态)
+3. pstyv = 'ZTAB' OR IS NULL OR = '' (行项目类别)
+4. nokwmeng > 0 (未发货数量 > 0)  -- 部分版本有
+```
+
+**计算模式**：
+```
+stock_first: 先库存 → 库存+组装单 → 仅组装单
+production_first: 先组装单 → 组装单+库存 → 仅库存
+```
+
+**6种发货满足类型**：
+1. 完全库存满足
+2. 库存+组装单满足
+3. 组装单满足
+4. 库存部分满足
+5. 组装单部分满足
+6. 无法满足
+
+**3种可发货状态**：
+- 可发货 (绿色): 全部满足
+- 不建议发货 (淡绿): 部分满足
+- 不可发货 (白): 无法满足
+
+### 4.5 计划关联产出（基料可下达判断）
+
+```
+对基料子项:
+  planned_rel = 计划工单产出 + PP019工单未完成产出
+  shortage = (planned_rel < req_qty) OR (stock < req_qty)
+  has_plan = (此物料有计划工单)
+  
+  IF shortage AND has_plan:
+    item_ok = (工作中心匹配) AND (非基料子项都OK)
+  ELSE:
+    item_ok = (stock >= req_qty)
+
+父项可下达 = 所有基料子项OK AND 所有非基料子项库存满足
+```
+
+---
+
+## 五、完整API清单 (110个路由)
+
+### 5.1 静态/健康检查 (5个)
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| GET | `/` | 首页，返回enhanced.html |
+| GET | `/<path:filename>` | 静态文件服务 |
+| GET | `/favicon.ico` | 返回204 |
+| GET | `/api/health` | 健康检查 |
+| GET | `/api/metadata/fields` | 字段元数据 |
+
+### 5.2 孔雀排程核心 (8个)
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| POST | `/api/calculate/readiness` | 齐备套计算 (需本机) |
+| POST | `/api/calculate/priority` | 优先级计算 |
+| GET | `/api/calculate/last-info` | 获取上次计算信息 |
+| POST | `/api/peacock/calculate` | 新版排程计算 (需本机) |
+| GET | `/api/peacock/schedules` | 获取排程结果列表 |
+| GET | `/api/peacock/schedule/<id>/details` | 排程详情 |
+| GET | `/api/peacock/logs` | 计算日志 |
+| GET | `/api/peacock/statistics` | 排程统计 |
+
+### 5.3 SAP数据读取 (7个)
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| POST | `/api/sap/orders` | PP077B 读取计划订单 |
+| POST | `/api/sap/work-orders` | PP019 读取生产工单 |
+| POST | `/api/sap/work-orders-items` | PP019 读取工单组件 |
+| POST | `/api/sap/master-data` | PP087 读取物料主数据 |
+| POST | `/api/sap/inventory` | MM066 读取库存 |
+| POST | `/api/sap/bom` | PP062 读取BOM |
+| POST | `/api/sap/customers` | 客户主数据读取 |
+
+### 5.4 销售订单 (7个)
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| GET | `/api/sap/sales-orders/auart-list` | 订单类型列表 |
+| POST | `/api/sap/sales-orders/read` | SD059 读取销售订单 |
+| GET | `/api/sales-orders/list` | 销售订单列表(含筛选+分页) |
+| GET | `/api/sales-orders` | 销售订单 |
+| POST | `/api/sales-orders/import` | 导入销售订单 |
+| GET | `/api/sales-orders/<order_id>` | 订单详情 |
+| GET | `/api/sales-orders/load-from-db` | 从数据库加载 |
+
+### 5.5 发货计划 (8个)
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| GET | `/api/delivery-plan/data-sources` | 数据源摘要 |
+| GET | `/api/delivery-plan/data-sources/detail/<source>` | 数据源详情 |
+| POST | `/api/delivery-plan/read-all` | 一键读取(串行调3个SAP接口) |
+| POST | `/api/delivery-plan/calculate` | 发货计划计算 |
+| GET | `/api/delivery-plan/results` | 计算结果 |
+| GET | `/api/delivery-plan/warehouses-enabled` | 启用仓库列表 |
+| GET | `/api/delivery-plan/material-details/<matnr>` | 物料详情 |
+| GET | `/api/delivery-plan/diag` | 诊断 |
+
+### 5.6 数据库/配置 (6个)
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| GET/POST | `/api/database/test` | 测试数据库连接 |
+| GET | `/api/database/status` | 数据库状态 |
+| POST | `/api/database/query` | 执行SQL查询 |
+| GET | `/api/database/connections` | 连接列表 |
+| POST | `/api/database/connections/switch` | 切换连接 |
+| GET | `/api/database/connections/test-all` | 测试全部连接 |
+
+### 5.7 系统配置 (8个)
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| POST | `/api/config/save` | 保存配置 |
+| GET | `/api/config/load` | 加载配置 |
+| GET/POST | `/api/config/sap` | 获取/保存SAP配置 |
+| POST | `/api/config/sap/test` | 测试SAP连接 |
+| GET | `/api/system/config` | 系统配置 |
+| POST | `/api/system/config/mac` | 设置授权MAC |
+| POST | `/api/system/verify-machine` | 验证机器 |
+
+### 5.8 计算逻辑配置 (8个)
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| GET | `/api/calc-logic/config` | 计算逻辑配置 |
+| GET | `/api/calc-logic/presets` | 预设列表 |
+| GET/POST/DELETE | `/api/calc-logic/presets/<id>` | 预设CRUD |
+| POST | `/api/calc-logic/presets/<id>/activate` | 激活预设 |
+| GET | `/api/calc-logic/order-items/<order_no>` | 工单计算项 |
+| POST | `/api/calc-logic/simulate` | 模拟计算 |
+
+### 5.9 其他业务API (约60个)
+包括：products CRUD、customers CRUD、inventory管理(含Excel导入)、work_orders管理、warehouse_locations管理(CRUD+导入)、barcode_inventory管理(CRUD+导入)、work_centers、无限量物料管理、BOM管理、SAP接口管理、数据管理(save/load/backup)等。
+
+---
+
+## 六、前端页面结构 (9个主标签页)
+
+### 6.1 标签页布局顺序
+```
+1. 📋 订单管理 (隐藏, display:none)
+2. ⚙️ 基础参数
+3. 🚀 排程计算
+4. 📦 发货计划
+5. 📋 工单管理
+6. 📦 SAP库存管理
+7. 🏷️ 条码库存管理
+8. 🛒 销售订单
+9. ⚙️ 系统配置
+```
+
+### 6.2 基础参数 — 10个子标签
+```
+🏭 物料管理   → PP087 SAP读取+本地过滤面板(30列表格)
+🧩 BOM管理    → PP062 SAP读取
+🏢 工作中心   → 本地管理
+📞 SAP客户管理 → 客户主数据接口
+⚙️ 设备管理   → 本地CRUD
+👷 人员管理   → 本地CRUD
+⚡ 能耗管理   → 按设备配置
+⚖️ 权重配置   → 排程算法权重
+🏠 仓库仓位   → Excel导入+CRUD
+♾️ 无限量物料 → 白名单管理
+```
+
+### 6.3 排程计算 — 核心界面
+```
+├── SAP计划订单导入面板
+│   ├── 过滤器: 工厂/日期/优先级/工作中心(多选)/分类(多选)
+│   ├── 按钮: 读取/加载/导入排程/清除
+│   └── 预览表格(双栏: 表格+概览面板)
+├── 排程计算面板
+│   ├── 工单过滤 + 仓库选择
+│   ├── 算法选择: FCFS/优先级/交期/SPT/能耗/均衡/MRP
+│   ├── 参数: 优先级权重/设备利用率/成本权重
+│   └── 按钮: 🦚开始计算 / ⚡一键计算
+├── 甘特图
+├── 排程结果表格
+└── 工单计划(可拖拽排序)
+```
+
+### 6.4 发货计划
+```
+├── 3个可折叠数据源面板
+│   ├── 🛒 销售订单(SD059过滤器)
+│   ├── 🏭 生产工单(PP019过滤器)
+│   └── 📦 SAP库存(MM066过滤器+仓库排除)
+├── 🚀 一键读取按钮(紫色横幅)
+├── 计算区域
+│   ├── 提前天数 / 优先选项(库存优先/组装单优先)
+│   ├── 创建日期范围 + 交货日期范围
+│   └── 🚀 发货计划计算
+├── 结果过滤面板(6个过滤条件)
+└── 结果表格(16列, 彩色状态标识)
+```
+
+### 6.5 工单管理
+```
+├── CO01创建表单: 物料/订单类型/工厂/作业中心/数量/日期
+├── 操作按钮: 创建/从排程生成/清空/生成SAP/下达/反下达/删除
+├── PP019读取面板: 工厂/工单号/日期/最大条数/增量-全量
+├── 过滤面板V2.0: 11个过滤条件AND组合
+├── 双栏布局: 左=组件详情 / 右=工单列表(24列+排序+分页)
+└── 系统状态说明: CRTD/PLAN/REL/PRUN/TECO/CLSD
+```
+
+### 6.6 SAP库存管理
+```
+├── 操作: 从SAP读取(MM066) / Excel导入 / 从DB读取
+├── SAP过滤器: 工厂/物料/仓库/批次/最大条数
+├── 库存概览MMBE: 6个数值(按物料类型分)
+├── 仓库选择: 全选/全不选/动态复选框
+├── 库存明细: 14列表格+排序+分页
+└── 库存移动MIGO: 物料/移动类型(101/261/MI07)/数量
+```
+
+### 6.7 销售订单管理
+```
+├── SAP读取(SD059): 组织/订单号/日期/类型/行项类别
+├── 统计: 订单数/金额/待排程/已排程
+├── 本地过滤器: 状态/优先级
+├── 双表级联:
+│   ├── 表头(13列): 含状态复选框过滤(ABC多选)
+│   └── 表体(15列): 含行状态/交货状态/行项目类别
+└── 过滤器: 组织/客户/订单号/日期/物料/描述等
+```
+
+### 6.8 条码库存管理
+```
+├── 操作: 从DB读取 / Excel导入 / 搜索
+├── 统计: 总记录数/仓库数/批次数/已禁用数
+├── 20列表格: 含批号/保质期/生产日期/货位/规格
+└── 分页: 20/50/100/200条/页
+```
+
+### 6.9 系统配置 — 4个子标签
+```
+🗓️ 排程配置: 模块开关(7个模块独立开关)
+🗄️ 数据库配置: 连接管理/测试
+🔗 SAP接口配置: 7个SAP连接管理+字段结构名册
+🧠 计算逻辑: 交互式步骤流/规则编辑器/预设方案管理
+```
+
+---
+
+## 七、关键技术规范
+
+### 7.1 数据库驱动
+```python
+# 优先 pymssql (%s占位符, paramstyle=pyformat)
+# 备用 pyodbc (?占位符, paramstyle=qmark)
+# 项目所有SQL均使用 %s 占位符
+import pymssql
+conn = pymssql.connect(server=host, user=user, password=pwd, database=dbname, port=port)
+cur.execute("SELECT * FROM t WHERE col=%s", (val,))
+```
+
+### 7.2 前端API调用
+```javascript
+// 使用相对路径，支持远程访问
+const API_BASE_URL = '/api';  // 不是 'http://localhost:5000/api'
+fetch(API_BASE_URL + '/calculate/readiness', {method: 'POST', body: JSON.stringify(data)})
+```
+
+### 7.3 数据写入模式
+- `products`: UPSERT by material_code (增量保留本地字段)
+- `inventory`: DELETE ALL → INSERT ALL (全量替换)
+- `sap_planned_orders`: UPSERT by plnum (计划订单)
+- `sap_sales_orders`: 删除被更新订单的旧行项目 → INSERT新行项目
+- `work_orders`: UPSERT by sap_aufnr (生产工单)
+
+### 7.4 增量同步逻辑
+```
+PP019: SELECT MAX(updated_at) FROM work_orders → 用作 AEDAT1
+PP087: SELECT MAX(updated_at) FROM products WHERE data_source='sap_pp087'
+SD059: SELECT MAX(updated_at) FROM sap_sales_orders
+空表或无记录 → 降级为全量模式
+```
+
+### 7.5 前端 localStorage 键
+```
+dp_created_from, dp_created_to    -- 发货计划创建日期
+dp_due_from, dp_due_to            -- 发货计划交货日期
+dp_sd059_filters                  -- 发货-SD059过滤器
+dp_pp019_filters                  -- 发货-PP019过滤器
+dp_inv_filters                    -- 发货-库存过滤器
+sap_sd059_filters                 -- 销售-SD059过滤器
+work_orders_sync_time             -- 工单同步时间
+```
+
+---
+
+## 八、重建实施建议
+
+### 最小可用版本 (MVP)
+1. 数据库：创建核心表 (①-⑬ 共13张)
+2. SAP接口：实现 PP077B + PP019 + MM066 + SD059 (4个)
+3. 计算引擎：实现 ReadinessCalculator + PriorityCalculator
+4. 前端：排程计算 + 工单管理 + 发货计划 (3个核心页签)
+5. API：只暴露核心路由 (约40个)
+
+### 完整版本
+按本文档全部110个路由、25张表、9个页签实施。
+
+### 注意要点
+- 所有SAP XML解析必须用 `ET.fromstring()` + `tag.split('}')[-1]`，禁止正则清理命名空间
+- 数据库占位符统一用 `%s` (pymssql风格)
+- 前端API_BASE_URL 用相对路径 `/api`
+- 库存字段映射：quantity=sap_labst, sap_insme/sap_speme/sap_umlme 用于质检/冻结/在途
+- 子项物料单位转换：G→KG 需 ÷1000，但前端 `_recalcCumulativeAvailability()` 预计算后已是KG值，通过 `_cumPrecomputed` 标记避免二次转换
+- MM066 PRD环境超时时自动降级到QAS(50000端口)
+- SD059 PSTYV字段SAP实际不返回，过滤时需兼容NULL

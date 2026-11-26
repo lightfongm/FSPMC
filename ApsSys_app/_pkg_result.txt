@@ -1,0 +1,21 @@
+﻿{
+  "orig": [
+    "包装",
+    "1.00"
+  ],
+  "warn_count": 1,
+  "pkg": [
+    {
+      "material_code": "VALPK01",
+      "name": "验证包装F",
+      "type": "包材",
+      "missing_field": "采购周期",
+      "current_value": "0.00"
+    }
+  ],
+  "restored": [
+    "包装",
+    "1.00"
+  ],
+  "result": "PASS"
+}
